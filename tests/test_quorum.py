@@ -108,6 +108,12 @@ def test_spans():
            "deadline": "2026-09-18T00:00:00+00:00"}
     s = spans.root_span_open("test-p1", cfg, "att-1", now=1000.0)
     check("root open: OPEN", s["status"] == "OPEN" and s["parent_span_id"] is None)
+    a = s["attributes"]
+    check("root: classifier contract",
+          a["service.name"] == "quorum-mcp"
+          and a["quorum.proposal_id"] == "test-p1"
+          and a["quorum.operation"] == "proposal"
+          and a["quorum.algorithm"] == "approval")
     s2 = spans.root_span_close("test-p1", cfg, "att-1", 1000.0, "OK", now=1257.0)
     check("root close: same id + duration",
           s2["span_id"] == s["span_id"] and s2["duration_ms"] == 257000.0)
@@ -115,16 +121,32 @@ def test_spans():
                           "att-2", 1000.0, 1000.05)
     check("write span: parent + no value",
           ws["parent_span_id"] == s["span_id"]
-          and "value" not in ws["attributes"])
+          and "value" not in ws["attributes"]
+          and "quorum.value" not in ws["attributes"])
+    check("write span: operation + author",
+          ws["attributes"]["quorum.operation"] == "blackboard.write"
+          and ws["attributes"]["quorum.author"] == "agent-a")
     vs = spans.vote_span("test-p1", 3, "v1", "borda", ["a", "b", "c"], 1,
                          "early", "att-3", 1000.0, 1000.02)
     check("vote span: borda hashed",
-          vs["attributes"]["vote"].startswith("sha256:"))
+          vs["attributes"]["quorum.vote"].startswith("sha256:"))
+    check("vote span: voter_identity",
+          vs["attributes"]["quorum.voter_identity"] == "v1")
     vs2 = spans.vote_span("test-p1", 4, "v2", "plurality", "a", 2, "late",
                           "att-4", 1000.0, 1000.02)
     check("vote span: option name + timing",
-          vs2["attributes"]["vote"] == "a"
-          and vs2["attributes"]["vote_timing"] == "late")
+          vs2["attributes"]["quorum.vote"] == "a"
+          and vs2["attributes"]["quorum.vote_timing"] == "late")
+    outcome = {"algorithm": "plurality", "status": "decided", "winner": "a",
+               "votes_cast": 2, "expected_voters": 2, "abstained": [],
+               "quorum_met": True, "confidence": 1.0,
+               "attestation_id": "att-5", "co_winners": ["a"],
+               "breakdown": {}}
+    rs = spans.resolve_span("test-p1", 5, outcome, 1000.0, 1001.0)
+    check("resolve span: outcome + algorithm",
+          rs["attributes"]["quorum.operation"] == "resolve"
+          and rs["attributes"]["quorum.outcome"] == "a"
+          and rs["attributes"]["quorum.algorithm"] == "plurality")
 
 
 async def _call(name, args, _id=[0]):

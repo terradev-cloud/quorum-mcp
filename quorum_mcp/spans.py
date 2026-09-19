@@ -95,8 +95,19 @@ def _iso(ts):
 
 
 def _span(name, proposal_id, seq, start_ts, end_ts, status, attributes):
-    """Build one span dict. seq=None -> the root span."""
+    """Build one span dict. seq=None -> the root span.
+
+    Every span carries the classifier contract: service.name (fixed
+    discriminator), quorum.proposal_id (trace linkage), and
+    quorum.operation (lifecycle position). Telinea routes on these;
+    generic dashboards see standard OTel fields."""
     root = seq is None
+    attributes = {
+        "service.name": SERVICE,
+        "quorum.proposal_id": proposal_id,
+        "quorum.operation": name,
+        **attributes,
+    }
     return {
         "trace_id": trace_id_for(proposal_id),
         "span_id": (root_span_id_for(proposal_id) if root
@@ -130,12 +141,11 @@ def root_span_close(proposal_id, cfg, attestation_id, opened_ts,
 
 def _root_attrs(cfg, attestation_id):
     return {
-        "proposal_id": cfg["proposal_id"],
-        "question": cfg["question"],
-        "algorithm": cfg["algorithm"],
-        "expected_voters": len(cfg["voters"]),
-        "quorum_pct": cfg["quorum"],
-        "deadline": cfg["deadline"],
+        "quorum.algorithm": cfg["algorithm"],
+        "quorum.question": cfg["question"],
+        "quorum.expected_voters": len(cfg["voters"]),
+        "quorum.quorum_pct": cfg["quorum"],
+        "quorum.deadline": cfg["deadline"],
         "attestation_id": attestation_id,
     }
 
@@ -144,11 +154,10 @@ def write_span(proposal_id, seq, key, author, value, attestation_id,
                start_ts, end_ts):
     return _span("blackboard.write", proposal_id, seq, start_ts, end_ts,
                  "OK", {
-                     "proposal_id": proposal_id,
-                     "key": key,
-                     "author": author,
+                     "quorum.key": key,
+                     "quorum.author": author,
                      # size only -- blackboard content stays in Quorum
-                     "value_bytes": len(json.dumps(value)),
+                     "quorum.value_bytes": len(json.dumps(value)),
                      "attestation_id": attestation_id,
                  })
 
@@ -170,39 +179,39 @@ def _vote_repr(algorithm, value):
 def vote_span(proposal_id, seq, voter, algorithm, value, vote_number,
               vote_timing, attestation_id, start_ts, end_ts):
     return _span("vote", proposal_id, seq, start_ts, end_ts, "OK", {
-        "proposal_id": proposal_id,
-        "voter": voter,
-        "vote": _vote_repr(algorithm, value),
-        "vote_seq": vote_number,
+        # voter_identity is how Telinea's agent registry builds the
+        # agent map for governance traces
+        "quorum.voter_identity": voter,
+        "quorum.vote": _vote_repr(algorithm, value),
+        "quorum.vote_seq": vote_number,
         # conformity-bias signal: early = first vote cast, late = cast
         # after a majority was already reached, median = between
-        "vote_timing": vote_timing,
+        "quorum.vote_timing": vote_timing,
         "attestation_id": attestation_id,
     })
 
 
 def resolve_span(proposal_id, seq, outcome, start_ts, end_ts):
     attrs = {
-        "proposal_id": proposal_id,
-        "algorithm": outcome["algorithm"],
-        "votes_cast": outcome["votes_cast"],
-        "expected_voters": outcome["expected_voters"],
-        "abstained": len(outcome["abstained"]),
-        "quorum_met": outcome["quorum_met"],
-        "confidence": outcome.get("confidence"),
+        "quorum.algorithm": outcome["algorithm"],
+        "quorum.votes_cast": outcome["votes_cast"],
+        "quorum.expected_voters": outcome["expected_voters"],
+        "quorum.abstained": len(outcome["abstained"]),
+        "quorum.quorum_met": outcome["quorum_met"],
+        "quorum.confidence": outcome.get("confidence"),
         "attestation_id": outcome.get("attestation_id"),
     }
     if outcome["status"] == "decided":
-        attrs["winner"] = outcome["winner"]
+        attrs["quorum.outcome"] = outcome["winner"]
         status = "OK" if outcome["quorum_met"] else "ERROR"
     else:
-        attrs["co_winners"] = outcome["co_winners"]
+        attrs["quorum.co_winners"] = outcome["co_winners"]
         if outcome["algorithm"] == "condorcet":
-            attrs["cycle"] = outcome["breakdown"].get("cycle")
+            attrs["quorum.cycle"] = outcome["breakdown"].get("cycle")
         if outcome["algorithm"] == "supermajority":
-            attrs["leader_share_pct"] = outcome["breakdown"].get(
+            attrs["quorum.leader_share_pct"] = outcome["breakdown"].get(
                 "leader_share_pct")
-            attrs["threshold_pct"] = outcome["breakdown"].get(
+            attrs["quorum.threshold_pct"] = outcome["breakdown"].get(
                 "threshold_pct")
         status = "UNRESOLVED"
     return _span("resolve", proposal_id, seq, start_ts, end_ts, status,
