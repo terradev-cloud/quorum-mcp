@@ -194,6 +194,12 @@ def opinion_pool(votes, options, **_cfg):
         for o in options:
             pooled[o] += dist[o]
     n = len(votes)
+    if n == 0:
+        # No ballots: every option ties at zero -- unresolved, not a
+        # division-by-zero crash.
+        return _unresolved(sorted(options),
+                           {"distribution": {o: 0.0 for o in options},
+                            "ballots": 0})
     pooled = {o: pooled[o] / n for o in options}
     winners, top = _top(pooled)
     breakdown = {"distribution": {o: round(pooled[o], 6) for o in options},

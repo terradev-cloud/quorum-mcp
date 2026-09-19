@@ -37,6 +37,7 @@ reachable.
 import asyncio
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -72,6 +73,11 @@ MAX_AUTHOR = 256
 # Growth caps: a public endpoint needs a ceiling on disk consumption.
 MAX_PROPOSALS = int(os.environ.get("QUORUM_MAX_PROPOSALS", "10000"))
 MAX_ACCOUNTS = int(os.environ.get("QUORUM_MAX_ACCOUNTS", "10000"))
+# Per-proposal event ceiling: appends compute seq by counting lines, so
+# an uncapped log is quadratic I/O; every load replays the whole file.
+MAX_EVENTS = int(os.environ.get("QUORUM_MAX_EVENTS", "10000"))
+# A proposal can't reasonably need more than a year of voting window.
+MAX_DEADLINE_MINUTES = 60 * 24 * 365
 
 TOOLS = [
     {
@@ -426,7 +432,15 @@ _RATE_PER_MIN = int(os.environ.get("QUORUM_PROPOSAL_RATE", "120"))
 _rate_windows = {}  # proposal_id -> deque of monotonic timestamps
 
 
+_RATE_WINDOWS_MAX = 10_000
+
+
 def _rate_check(proposal_id):
+    # Only real ids get a window: arbitrary keys would let an attacker
+    # grow _rate_windows forever (and unhashable ids would crash here).
+    if not isinstance(proposal_id, str) or not store.valid_id(
+            proposal_id):
+        return
     now = time.monotonic()
     dq = _rate_windows.setdefault(proposal_id, deque())
     while dq and now - dq[0] > 60:
@@ -438,6 +452,13 @@ def _rate_check(proposal_id):
             f"{_RATE_PER_MIN} events/min",
             "slow down, or raise QUORUM_PROPOSAL_RATE on the server")
     dq.append(now)
+    if len(_rate_windows) > _RATE_WINDOWS_MAX:
+        # Bound the map: drop idle windows first; if everything is hot,
+        # clear all -- a brief fail-open beats unbounded growth.
+        for k in [k for k, d in _rate_windows.items() if not d]:
+            del _rate_windows[k]
+        if len(_rate_windows) > _RATE_WINDOWS_MAX:
+            _rate_windows.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -738,10 +759,12 @@ async def _propose(args):
     deadline_minutes = args.get("deadline_minutes")
     if isinstance(deadline_minutes, bool) or \
             not isinstance(deadline_minutes, (int, float)) or \
-            deadline_minutes <= 0:
+            not math.isfinite(deadline_minutes) or \
+            not 0 < deadline_minutes <= MAX_DEADLINE_MINUTES:
         raise QuorumError(
             "invalid_deadline",
-            "deadline_minutes must be a positive number",
+            f"deadline_minutes must be a finite number in "
+            f"(0, {MAX_DEADLINE_MINUTES}]",
             "set how many minutes voting stays open")
     quorum = args.get("quorum", 100)
     if isinstance(quorum, bool) or not isinstance(quorum, (int, float)) \
@@ -858,6 +881,11 @@ async def _write(args):
                 "proposal_closed",
                 f"proposal '{pid}' is resolved; the blackboard is sealed",
                 "read the final record with history")
+        if len(state["events"]) >= MAX_EVENTS:
+            raise QuorumError(
+                "proposal_full",
+                f"proposal '{pid}' hit the {MAX_EVENTS}-event limit",
+                "open a new proposal -- this log is at capacity")
         record = await _attest(
             {"type": "write", "proposal_id": pid, **data})
         ev = store.append_unlocked(pid, "write", data, record)
@@ -925,6 +953,11 @@ async def _vote(args):
                 "deadline_passed",
                 f"the deadline {cfg['deadline']} has passed",
                 "the vote window is closed; call resolve")
+        if len(state["events"]) >= MAX_EVENTS:
+            raise QuorumError(
+                "proposal_full",
+                f"proposal '{pid}' hit the {MAX_EVENTS}-event limit",
+                "open a new proposal -- this log is at capacity")
         # Conformity-bias signal: early = first vote, late = cast after
         # a majority of expected voters had already voted.
         prior = len(state["votes"])
@@ -944,17 +977,19 @@ async def _vote(args):
 
 async def _resolve(args):
     pid = args.get("proposal_id")
-    state = _load_or_err(pid)
+    # _maybe_auto_resolve first: an expired proposal with quorum resolves
+    # here; one without quorum gets its root span closed ERROR and stays
+    # unresolved -- the same end state the lazy path produces.
+    state = await _maybe_auto_resolve(_load_or_err(pid))
     if state["resolved"]:
         return _ok(state["outcome"])  # idempotent
-    if not store.quorum_met(state) and not store.deadline_passed(state):
+    if not store.quorum_met(state):
         cfg = state["config"]
         raise QuorumError(
             "quorum_not_met",
             f"{len(state['votes'])}/{len(cfg['voters'])} votes cast; "
             f"quorum is {cfg['quorum']}%",
-            "wait for more votes or the deadline, or lower quorum "
-            "on a future proposal")
+            "wait for more votes, or lower quorum on a future proposal")
     outcome = await _do_resolve(pid)
     return _ok(outcome)
 
@@ -1004,10 +1039,16 @@ _TOOLS_DISPATCH = {
 
 
 async def call_tool(name, arguments):
-    fn = _TOOLS_DISPATCH.get(name)
+    # name must be a string: an unhashable type (list/dict) raises
+    # TypeError in .get() -- outside the try, that crashed the server.
+    fn = _TOOLS_DISPATCH.get(name) if isinstance(name, str) else None
     if fn is None:
         return _err("unknown_tool", f"Unknown tool: {name}",
                     f"available: {', '.join(sorted(_TOOLS_DISPATCH))}")
+    if arguments is not None and not isinstance(arguments, dict):
+        return _err("invalid_params",
+                    "tool arguments must be an object",
+                    "pass arguments as a JSON object")
     try:
         return await fn(arguments or {})
     except QuorumError as e:
@@ -1037,7 +1078,12 @@ async def dispatch(req):
     msg_id = req.get("id")  # None -> notification -> never respond
 
     if method == "initialize":
-        requested = (req.get("params") or {}).get("protocolVersion")
+        params = req.get("params")
+        if params is not None and not isinstance(params, dict):
+            if msg_id is None:
+                return None
+            return error_response(msg_id, -32602, "Invalid params")
+        requested = (params or {}).get("protocolVersion")
         result = {
             "protocolVersion": requested or "2024-11-05",
             "capabilities": {"tools": {}},
@@ -1084,6 +1130,11 @@ def main():
         try:
             req = json.loads(line)
         except json.JSONDecodeError:
+            _write_msg(error_response(None, -32700, "Parse error"))
+            continue
+        except Exception:
+            # RecursionError on deeply nested input, etc. -- one bad
+            # line must not kill the stdio loop.
             _write_msg(error_response(None, -32700, "Parse error"))
             continue
         if not isinstance(req, dict):

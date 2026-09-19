@@ -59,6 +59,11 @@ def mutation_lock(proposal_id):
     their awaits; plain append() acquires it internally."""
     loop = asyncio.get_running_loop()
     with _locks_guard:
+        # stdio runs one loop per message -- sweep dead loops so the
+        # map can't grow without bound.
+        if len(_locks) > 32:
+            for dead in [l for l in _locks if l.is_closed()]:
+                del _locks[dead]
         per_loop = _locks.setdefault(loop, {})
         return per_loop.setdefault(proposal_id, asyncio.Lock())
 
@@ -128,9 +133,13 @@ def load(proposal_id):
                 if not line:
                     continue
                 try:
-                    events.append(json.loads(line))
+                    ev = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # Tolerate structurally incomplete lines: a corrupt
+                # entry is skipped, not a crash on every future load.
+                if isinstance(ev, dict) and "seq" in ev:
+                    events.append(ev)
     except OSError:
         return None
     if not events or events[0].get("type") != "propose":
@@ -141,7 +150,9 @@ def load(proposal_id):
              "resolved": False}
     for ev in events[1:]:
         t = ev.get("type")
-        d = ev.get("data") or {}
+        d = ev.get("data")
+        if not isinstance(d, dict):
+            d = {}
         att_id = (ev.get("attestation") or {}).get("id")
         if t == "write":
             state["entries"].append({

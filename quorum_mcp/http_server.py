@@ -185,6 +185,11 @@ async def handle_mcp_get(request):
     return resp
 
 
+# JSON-RPC batch ceiling: one request body can carry thousands of
+# messages that would all dispatch under a single semaphore slot.
+_MAX_BATCH = 64
+
+
 async def _dispatch_one(m):
     if not isinstance(m, dict):
         return error_response(None, -32600, "Invalid Request")
@@ -207,6 +212,13 @@ async def handle_mcp(request):
 
     async with sem:
         if isinstance(body, list):
+            if not body or len(body) > _MAX_BATCH:
+                return _json_response(
+                    error_response(
+                        None, -32600,
+                        f"Invalid Request: batch must be 1-{_MAX_BATCH} "
+                        "messages"),
+                    status=400)
             responses = []
             for m in body:
                 r = await _dispatch_one(m)

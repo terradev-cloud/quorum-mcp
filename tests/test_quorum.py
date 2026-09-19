@@ -518,6 +518,118 @@ async def test_audit_fixes():
           any(e["type"] == "write" for e in state["events"]))
 
 
+async def test_audit_fixes_2():
+    # -- unhashable/non-string tool name -> error, not crash --
+    r = await server.call_tool(["vote"], {})
+    check("unhashable tool name -> unknown_tool",
+          r.get("isError") and "unknown_tool" in r["content"][0]["text"])
+    r = await server.call_tool(None, {})
+    check("none tool name -> unknown_tool",
+          r.get("isError") and "unknown_tool" in r["content"][0]["text"])
+
+    # -- non-dict arguments -> clean error --
+    r = await server.call_tool("vote", ["not", "a", "dict"])
+    check("non-dict arguments -> invalid_params",
+          r.get("isError") and "invalid_params" in r["content"][0]["text"])
+
+    # -- initialize with non-dict params -> -32602, not crash --
+    r = await server.dispatch({"jsonrpc": "2.0", "id": 1,
+                               "method": "initialize", "params": "x"})
+    check("initialize bad params -> -32602",
+          r.get("error", {}).get("code") == -32602)
+    r = await server.dispatch({"jsonrpc": "2.0", "id": 2,
+                               "method": "initialize"})
+    check("initialize still works", "result" in r)
+
+    # -- deadline_minutes: NaN, inf, huge all rejected --
+    for bad in (float("nan"), float("inf"), 1e12, -5):
+        out, err = await _call("propose", {
+            "name": f"dl-{bad}", "question": "q", "voters": ["v1"],
+            "deadline_minutes": bad})
+        check(f"deadline {bad} rejected", err
+              and out["error"]["code"] == "invalid_deadline", str(out))
+
+    # -- opinion_pool with zero votes -> unresolved, not crash --
+    out = aggregate("opinion_pool", [], ["a", "b"])
+    check("opinion_pool empty -> unresolved",
+          out["status"] == "unresolved"
+          and out["co_winners"] == ["a", "b"])
+
+    # -- rate windows: invalid ids don't pollute the map --
+    server._rate_windows.clear()
+    server._rate_check(None)
+    server._rate_check(["x"])
+    server._rate_check("../evil")
+    server._rate_check("not-a-real-proposal-but-valid-id")
+    check("rate windows skip invalid ids",
+          None not in server._rate_windows
+          and len(server._rate_windows) == 1)
+
+    # -- resolve after deadline without quorum -> quorum_not_met --
+    out, err = await _call("propose", {
+        "name": "expired-noq", "question": "q", "voters": ["v1", "v2"],
+        "deadline_minutes": 0.0001})  # ~6ms
+    assert not err, out
+    await asyncio.sleep(0.05)
+    out, err = await _call("resolve", {"proposal_id": "expired-noq"})
+    check("expired no-quorum resolve -> quorum_not_met", err
+          and out["error"]["code"] == "quorum_not_met", str(out))
+    state = server.store.load("expired-noq")
+    check("no resolve event appended",
+          not any(e["type"] == "resolve" for e in state["events"]))
+
+    # -- malformed log lines tolerated --
+    path = os.path.join(os.environ["QUORUM_DATA_DIR"],
+                        "expired-noq.jsonl")
+    with open(path, "a") as f:
+        f.write('{"type":"write"}\n')          # no seq
+        f.write('{"seq":99,"type":"write","data":"oops"}\n')
+        f.write('not json at all\n')
+    state = server.store.load("expired-noq")
+    check("load tolerates malformed lines",
+          state is not None and state["config"]["proposal_id"]
+          == "expired-noq")
+
+    # -- MAX_EVENTS cap --
+    old_max = server.MAX_EVENTS
+    server.MAX_EVENTS = 3
+    try:
+        out, err = await _call("propose", {
+            "name": "full-prop", "question": "q", "voters": ["v1"],
+            "deadline_minutes": 5})
+        assert not err, out
+        out, err = await _call("write", {
+            "proposal_id": "full-prop", "key": "k", "value": 1})
+        assert not err, out
+        out, err = await _call("write", {
+            "proposal_id": "full-prop", "key": "k2", "value": 2})
+        assert not err, out  # 3 events: propose + 2 writes, at cap
+        out, err = await _call("write", {
+            "proposal_id": "full-prop", "key": "k3", "value": 3})
+        check("event cap -> proposal_full", err
+              and out["error"]["code"] == "proposal_full", str(out))
+    finally:
+        server.MAX_EVENTS = old_max
+
+    # -- http batch cap --
+    from quorum_mcp import http_server
+    class FakeReq:
+        headers = {"Accept": "application/json"}
+        def __init__(self, body):
+            self._body = body
+        async def json(self):
+            return self._body
+    resp = await http_server.handle_mcp(FakeReq(
+        [{"jsonrpc": "2.0", "id": i, "method": "ping"}
+         for i in range(65)]))
+    check("batch >64 -> 400", resp.status == 400)
+    resp = await http_server.handle_mcp(FakeReq([]))
+    check("empty batch -> 400", resp.status == 400)
+    resp = await http_server.handle_mcp(FakeReq(
+        [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]))
+    check("batch of 1 ok", resp.status == 200)
+
+
 def main():
     print("\n-- algorithms --")
     test_algorithms()
@@ -533,6 +645,8 @@ def main():
     asyncio.run(test_namespace_rate_queue())
     print("\n-- audit fixes: races, redaction, caps, worker survival --")
     asyncio.run(test_audit_fixes())
+    print("\n-- audit round 2: crash guards, caps, resolve consistency --")
+    asyncio.run(test_audit_fixes_2())
     print()
     shutil.rmtree(_TMP, ignore_errors=True)
     if errors:
