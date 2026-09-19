@@ -149,6 +149,80 @@ def test_spans():
           and rs["attributes"]["quorum.algorithm"] == "plurality")
 
 
+def test_otlp_wire_format():
+    """Round-trip a span through the OTLP converter AND terradev-cloud's
+    actual ingest parser -- proves the payload lands as a real span row."""
+    cfg = {"proposal_id": "wire-p1", "question": "q?", "algorithm": "borda",
+           "voters": ["v1"], "quorum": 100,
+           "deadline": "2026-09-18T00:00:00+00:00"}
+    span = spans.root_span_open("wire-p1", cfg, "att-1", now=1000.0)
+    payload = spans._to_otlp_payload(span)
+
+    # Structural checks on the wire format itself
+    rs = payload["resourceSpans"][0]
+    check("otlp: resourceSpans present", "scopeSpans" in rs)
+    otlp_span = rs["scopeSpans"][0]["spans"][0]
+    check("otlp: ids + times",
+          otlp_span["traceId"] == span["trace_id"]
+          and otlp_span["spanId"] == span["span_id"]
+          and otlp_span["startTimeUnixNano"].isdigit())
+    check("otlp: status code", otlp_span["status"]["code"] == 0)  # OPEN->UNSET
+
+    # Feed through the real ingest parser from terradev-cloud. The module
+    # pulls FastAPI/SQLAlchemy/SECRET_KEY on import, so extract the pure
+    # parser functions from source via ast -- same code, no dep chain.
+    import ast, base64, binascii, typing
+    from datetime import datetime as _dt, timezone as _tz
+    src = open("/Users/theowolfenden/CascadeProjects/terradev-cloud/"
+               "api/terradev_cloud/routers/ingest.py").read()
+    tree = ast.parse(src)
+    wanted = {"_get", "_otlp_value", "_kv_list_to_dict", "_norm_id",
+              "_ns_to_iso", "_span_kind_name", "_status_name",
+              "_iter_otlp_spans", "_map_events"}
+    ns = {"json": json, "base64": base64, "binascii": binascii,
+          "datetime": _dt, "timezone": _tz,
+          "Any": typing.Any, "Dict": typing.Dict, "List": typing.List,
+          "Optional": typing.Optional, "Tuple": typing.Tuple}
+    found = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):  # module constants like _SPAN_KINDS
+            for t in node.targets:
+                if getattr(t, "id", "") == "_SPAN_KINDS":
+                    exec(compile(ast.Module([node], []), "<ing>", "exec"), ns)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name in wanted:
+            exec(compile(ast.Module([node], []), "<ing>", "exec"), ns)
+            found.add(node.name)
+    check("otlp: parser functions extracted", found == wanted,
+          str(wanted - found))
+    _iter_otlp_spans = ns["_iter_otlp_spans"]
+    _kv_list_to_dict = ns["_kv_list_to_dict"]
+    _norm_id = ns["_norm_id"]
+    _ns_to_iso = ns["_ns_to_iso"]
+    _span_kind_name = ns["_span_kind_name"]
+    _status_name = ns["_status_name"]
+
+    parsed = list(_iter_otlp_spans(payload))
+    check("otlp: parser yields 1 span", len(parsed) == 1)
+    resource_attrs, sp = parsed[0]
+    check("otlp: resource service.name",
+          resource_attrs.get("service.name") == "quorum-mcp")
+    check("otlp: trace/span ids normalize",
+          _norm_id(sp.get("traceId"), 32) == span["trace_id"]
+          and _norm_id(sp.get("spanId"), 16) == span["span_id"])
+    check("otlp: kind + status",
+          _span_kind_name(sp.get("kind")) == "INTERNAL"
+          and _status_name(sp.get("status")) == "UNSET")
+    check("otlp: times parse",
+          _ns_to_iso(sp.get("startTimeUnixNano")) is not None)
+    attrs = _kv_list_to_dict(sp.get("attributes"))
+    check("otlp: quorum attrs survive",
+          attrs.get("quorum.proposal_id") == "wire-p1"
+          and attrs.get("quorum.operation") == "proposal"
+          and attrs.get("quorum.algorithm") == "borda"
+          and attrs.get("service.name") == "quorum-mcp")
+
+
 async def _call(name, args, _id=[0]):
     _id[0] += 1
     r = await server.dispatch({"jsonrpc": "2.0", "id": _id[0],
@@ -265,6 +339,8 @@ def main():
     test_accounts()
     print("\n-- spans --")
     test_spans()
+    print("\n-- OTLP wire format (round-trip through ingest parser) --")
+    test_otlp_wire_format()
     print("\n-- lifecycle (register -> propose -> write -> vote -> resolve -> history) --")
     asyncio.run(test_lifecycle())
     print()

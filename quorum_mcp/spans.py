@@ -219,6 +219,79 @@ def resolve_span(proposal_id, seq, outcome, start_ts, end_ts):
 
 
 # ---------------------------------------------------------------------------
+# OTLP wire format -- standard ExportTraceServiceRequest so the same spans
+# land in Telinea, Jaeger, Grafana, or any OTLP/HTTP collector.
+# ---------------------------------------------------------------------------
+
+_OTLP_STATUS = {"OK": 1, "ERROR": 2}  # UNSET=0 for OPEN/UNRESOLVED
+
+
+def _otlp_value(v):
+    """Python scalar -> OTLP AnyValue."""
+    if isinstance(v, bool):
+        return {"boolValue": v}
+    if isinstance(v, int):
+        return {"intValue": v}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, str):
+        return {"stringValue": v}
+    if isinstance(v, (list, tuple)):
+        return {"arrayValue": {"values": [_otlp_value(i) for i in v]}}
+    return {"stringValue": json.dumps(v, sort_keys=True)}
+
+
+def _otlp_attrs(attrs):
+    return [{"key": k, "value": _otlp_value(v)}
+            for k, v in attrs.items() if v is not None]
+
+
+def _iso_to_ns(iso):
+    return str(int(datetime.fromisoformat(iso).timestamp() * 1e9))
+
+
+def _to_otlp_span(span):
+    """Internal span dict -> OTLP span. The descriptive status (OPEN,
+    UNRESOLVED) survives as quorum.status; OTLP code is OK/ERROR/UNSET."""
+    attrs = dict(span["attributes"])
+    attrs.setdefault("quorum.status", span["status"])
+    otlp = {
+        "traceId": span["trace_id"],
+        "spanId": span["span_id"],
+        "name": span["name"],
+        "kind": 1,  # INTERNAL
+        "startTimeUnixNano": _iso_to_ns(span["start_time"]),
+        "endTimeUnixNano": _iso_to_ns(span["end_time"]),
+        "attributes": _otlp_attrs(attrs),
+        "status": {"code": _OTLP_STATUS.get(span["status"], 0)},
+    }
+    if span["parent_span_id"]:
+        otlp["parentSpanId"] = span["parent_span_id"]
+    return otlp
+
+
+def _to_otlp_payload(span):
+    """Wrap one span in an ExportTraceServiceRequest-shaped dict."""
+    resource_attrs = {
+        "service.name": SERVICE,
+        "service.version": __import__("quorum_mcp").__version__,
+    }
+    if WORKSPACE_ID:
+        resource_attrs["telinea.workspace_id"] = WORKSPACE_ID
+    if PROJECT_ID:
+        resource_attrs["telinea.project_id"] = PROJECT_ID
+    return {
+        "resourceSpans": [{
+            "resource": {"attributes": _otlp_attrs(resource_attrs)},
+            "scopeSpans": [{
+                "scope": {"name": SERVICE},
+                "spans": [_to_otlp_span(span)],
+            }],
+        }],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
 
@@ -247,16 +320,7 @@ async def emit_root_close_once(proposal_id, span, telinea_key=None):
 async def _push(span, telinea_key):
     try:
         import aiohttp
-        payload = {
-            "workspace_id": WORKSPACE_ID,
-            "project_id": PROJECT_ID,
-            "events": [{
-                "source": SERVICE,
-                "event_type": "span",
-                "ingested_at": _iso(time.time()),
-                "span": span,
-            }],
-        }
+        payload = _to_otlp_payload(span)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {telinea_key}",
