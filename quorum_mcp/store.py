@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import threading
 import time
 
 DATA_DIR = os.environ.get(
@@ -28,8 +29,8 @@ DATA_DIR = os.environ.get(
 # One lock per proposal id, guarded by a global lock. Mutations (appends)
 # serialize per proposal; loads replay unlocked -- readers never block
 # writers on other proposals.
-_locks = {}
-_locks_guard = asyncio.Lock()
+_locks = {}  # loop -> {proposal_id: asyncio.Lock}
+_locks_guard = threading.Lock()
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Namespaced ids: <namespace>:<name> -- one colon, each segment follows
@@ -52,32 +53,55 @@ def _path(proposal_id):
     return os.path.join(DATA_DIR, proposal_id + ".jsonl")
 
 
-async def _lock_for(proposal_id):
-    async with _locks_guard:
-        return _locks.setdefault(proposal_id, asyncio.Lock())
+def mutation_lock(proposal_id):
+    """The asyncio.Lock serializing mutations of one proposal on the
+    current loop. Compound operations (check-then-append) hold it across
+    their awaits; plain append() acquires it internally."""
+    loop = asyncio.get_running_loop()
+    with _locks_guard:
+        per_loop = _locks.setdefault(loop, {})
+        return per_loop.setdefault(proposal_id, asyncio.Lock())
 
 
 def exists(proposal_id):
     return valid_id(proposal_id) and os.path.exists(_path(proposal_id))
 
 
+def append_unlocked(proposal_id, event_type, data, attestation):
+    """Append one event WITHOUT taking the mutation lock -- caller must
+    hold mutation_lock(proposal_id). Returns the stored event."""
+    path = _path(proposal_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # seq = current line count; read once, cheap for these sizes
+    seq = 0
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for _ in f:
+                seq += 1
+    event = {
+        "seq": seq,
+        "type": event_type,
+        "at": time.time(),
+        "data": data,
+        "attestation": attestation,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    return event
+
+
 async def append(proposal_id, event_type, data, attestation):
-    """Append one event under the proposal lock. Returns the stored event."""
-    lock = await _lock_for(proposal_id)
-    async with lock:
-        seq = 1
-        try:
-            with open(_path(proposal_id)) as f:
-                for _ in f:
-                    seq += 1
-        except OSError:
-            pass
-        event = {"seq": seq, "type": event_type, "at": time.time(),
-                 "attestation": attestation, "data": data}
-        os.makedirs(os.path.dirname(_path(proposal_id)), exist_ok=True)
-        with open(_path(proposal_id), "a") as f:
-            f.write(json.dumps(event) + "\n")
-        return event
+    """Append one event to the proposal's log under the mutation lock."""
+    async with mutation_lock(proposal_id):
+        return append_unlocked(proposal_id, event_type, data, attestation)
+
+
+def proposal_count():
+    """Total proposals on disk (flat + namespaced). Used to cap growth."""
+    n = 0
+    for _root, _dirs, files in os.walk(DATA_DIR):
+        n += sum(1 for f in files if f.endswith(".jsonl"))
+    return n
 
 
 def load(proposal_id):

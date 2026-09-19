@@ -64,6 +64,14 @@ MAX_VOTERS = 1000
 MAX_OPTIONS = 100
 MAX_REASONING = 10_000
 MAX_KEY = 256
+MAX_VALUE_BYTES = 65_536      # serialized write value
+MAX_QUESTION = 4_096
+MAX_DESCRIPTION = 10_000
+MAX_VOTER_LEN = 256
+MAX_AUTHOR = 256
+# Growth caps: a public endpoint needs a ceiling on disk consumption.
+MAX_PROPOSALS = int(os.environ.get("QUORUM_MAX_PROPOSALS", "10000"))
+MAX_ACCOUNTS = int(os.environ.get("QUORUM_MAX_ACCOUNTS", "10000"))
 
 TOOLS = [
     {
@@ -355,9 +363,15 @@ async def _attest_drain(q):
                 "attested_at": datetime.now(timezone.utc).isoformat(),
                 "time_source": "local",
             }
-        for p, f in batch:
-            if not f.done():
-                f.set_result(_stamp_record(p, sample))
+        for payload, fut in batch:
+            try:
+                fut.set_result(_stamp_record(payload, sample))
+            except Exception as e:
+                # One bad payload must not kill the worker or wedge the
+                # rest of the batch -- surface the failure to that
+                # caller only.
+                if not fut.done():
+                    fut.set_exception(e)
 
 
 def _attest_queue():
@@ -382,7 +396,15 @@ async def _attest(payload):
             "pip install stamp-mcp and restart quorum")
     fut = asyncio.get_running_loop().create_future()
     _attest_queue().put_nowait((payload, fut))
-    return await fut
+    try:
+        # Shielded so a caller timeout doesn't cancel the worker's
+        # fulfillment; bounded so a dead worker can't hang a tool call.
+        return await asyncio.wait_for(asyncio.shield(fut), 30)
+    except asyncio.TimeoutError:
+        raise QuorumError(
+            "attestation_timeout",
+            "attestation did not complete within 30s",
+            "retry; if it persists, check stamp-mcp and NTP reachability")
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +543,7 @@ async def _maybe_auto_resolve(state):
     if state["resolved"] or not store.deadline_passed(state):
         return state
     if store.quorum_met(state):
-        await _do_resolve(state)
+        await _do_resolve(state["config"]["proposal_id"])
         return store.load(state["config"]["proposal_id"])
     # Expired without quorum: close the root span ERROR once. No resolve
     # event -- no outcome was computed, nothing to attest.
@@ -537,33 +559,42 @@ async def _maybe_auto_resolve(state):
     return state
 
 
-async def _do_resolve(state):
-    """Compute the outcome, attest it, append the resolve event."""
+async def _do_resolve(proposal_id):
+    """Compute the outcome, attest it, append the resolve event.
+
+    The resolved-check and the append happen under the proposal's
+    mutation lock, so two concurrent resolves can't both append -- the
+    loser returns the winner's outcome. Span emission stays outside the
+    lock (telemetry is best-effort, ordering irrelevant)."""
     t0 = time.time()
-    cfg = state["config"]
-    votes = [v["value"] for v in state["votes"].values()]
-    outcome = aggregate(cfg["algorithm"], votes, cfg["options"],
-                        threshold=cfg.get("threshold", 66.67))
-    abstained = sorted(v for v in cfg["voters"]
-                       if v not in state["votes"])
-    outcome.update({
-        "proposal_id": cfg["proposal_id"],
-        "algorithm": cfg["algorithm"],
-        "question": cfg["question"],
-        "votes_cast": len(state["votes"]),
-        "expected_voters": len(cfg["voters"]),
-        "quorum_met": store.quorum_met(state),
-        "abstained": abstained,
-        "vote_attestations": {
-            voter: rec["attestation_id"]
-            for voter, rec in state["votes"].items()},
-    })
-    record = await _attest({"type": "resolve",
-                            "proposal_id": cfg["proposal_id"],
-                            "outcome": outcome})
-    outcome["attestation_id"] = record["id"]
-    ev = await store.append(cfg["proposal_id"], "resolve", outcome,
-                            record)
+    async with store.mutation_lock(proposal_id):
+        state = store.load(proposal_id)
+        if state["resolved"]:
+            return state["outcome"]
+        cfg = state["config"]
+        votes = [v["value"] for v in state["votes"].values()]
+        outcome = aggregate(cfg["algorithm"], votes, cfg["options"],
+                            threshold=cfg.get("threshold", 66.67))
+        abstained = sorted(v for v in cfg["voters"]
+                           if v not in state["votes"])
+        outcome.update({
+            "proposal_id": cfg["proposal_id"],
+            "algorithm": cfg["algorithm"],
+            "question": cfg["question"],
+            "votes_cast": len(state["votes"]),
+            "expected_voters": len(cfg["voters"]),
+            "quorum_met": store.quorum_met(state),
+            "abstained": abstained,
+            "vote_attestations": {
+                voter: rec["attestation_id"]
+                for voter, rec in state["votes"].items()},
+        })
+        record = await _attest({"type": "resolve",
+                                "proposal_id": cfg["proposal_id"],
+                                "outcome": outcome})
+        outcome["attestation_id"] = record["id"]
+        ev = store.append_unlocked(proposal_id, "resolve", outcome,
+                                   record)
     # Resolution span (terminal child), then close the root span. Root
     # status: OK decided, UNRESOLVED ambiguous, ERROR no quorum.
     tkey = _telinea_key_for(cfg)
@@ -606,6 +637,11 @@ async def _register(args):
             "crypto_unavailable",
             "the cryptography package is not installed",
             "pip install cryptography and restart quorum")
+    if accounts.count() >= MAX_ACCOUNTS:
+        raise QuorumError(
+            "quota_exceeded",
+            f"account limit reached ({MAX_ACCOUNTS})",
+            "contact the server operator to raise QUORUM_MAX_ACCOUNTS")
     account_id = accounts.register(api_key, telinea_key.strip())
     return _ok({"account_id": account_id,
                 "registered": True,
@@ -650,24 +686,30 @@ async def _propose(args):
                 "namespace must be 1-64 chars of [A-Za-z0-9._-]",
                 "use a short tenant id like team-a or acme")
         name = f"{namespace}:{name}"
-    if store.exists(name):
-        raise QuorumError(
-            "proposal_exists",
-            f"proposal '{name}' already exists",
-            "choose a different name -- proposal ids are unique")
     question = args.get("question")
-    if not isinstance(question, str) or not question.strip():
+    if not isinstance(question, str) or not question.strip() or \
+            len(question) > MAX_QUESTION:
         raise QuorumError("invalid_question",
-                          "question must be a non-empty string",
+                          f"question must be a non-empty string "
+                          f"(max {MAX_QUESTION} chars)",
                           "state the decision as a question")
+    description = args.get("description")
+    if description is not None and \
+            (not isinstance(description, str)
+             or len(description) > MAX_DESCRIPTION):
+        raise QuorumError("invalid_description",
+                          f"description must be a string "
+                          f"(max {MAX_DESCRIPTION} chars)",
+                          "shorten the context text")
     voters = args.get("voters")
     if not isinstance(voters, list) or not voters or \
-            any(not isinstance(v, str) or not v for v in voters) or \
+            any(not isinstance(v, str) or not v
+                or len(v) > MAX_VOTER_LEN for v in voters) or \
             len(set(voters)) != len(voters) or len(voters) > MAX_VOTERS:
         raise QuorumError(
             "invalid_voters",
             "voters must be a non-empty list of unique identity "
-            f"strings (max {MAX_VOTERS})",
+            f"strings (max {MAX_VOTERS}, each <= {MAX_VOTER_LEN} chars)",
             "list the identities expected to call vote")
     options = args.get("options") or ["yes", "no"]
     if not isinstance(options, list) or len(options) < 2 or \
@@ -708,6 +750,12 @@ async def _propose(args):
             "threshold must be a percentage in (0, 100]",
             "set the required share of votes cast, e.g. 66.67")
 
+    if store.proposal_count() >= MAX_PROPOSALS:
+        raise QuorumError(
+            "quota_exceeded",
+            f"proposal limit reached ({MAX_PROPOSALS})",
+            "contact the server operator to raise QUORUM_MAX_PROPOSALS")
+
     deadline_ts = time.time() + deadline_minutes * 60
     cfg = {
         "account_id": account_id,
@@ -719,7 +767,7 @@ async def _propose(args):
         "proposal_id": name,
         "namespace": namespace,
         "question": question,
-        "description": args.get("description"),
+        "description": description,
         "options": options,
         "voters": voters,
         "algorithm": algorithm,
@@ -730,8 +778,16 @@ async def _propose(args):
             deadline_ts, tz=timezone.utc).isoformat(),
         "created_at": datetime.now(tz=timezone.utc).isoformat(),
     }
-    record = await _attest({"type": "propose", **cfg})
-    await store.append(name, "propose", cfg, record)
+    # exists-check and append under the mutation lock: two concurrent
+    # proposes with the same name can't both succeed.
+    async with store.mutation_lock(name):
+        if store.exists(name):
+            raise QuorumError(
+                "proposal_exists",
+                f"proposal '{name}' already exists",
+                "choose a different name -- proposal ids are unique")
+        record = await _attest({"type": "propose", **cfg})
+        store.append_unlocked(name, "propose", cfg, record)
     if telinea_key:
         accounts.cache_key(name, telinea_key)
     # Root span opens now; it closes at resolve or deadline expiry.
@@ -753,11 +809,6 @@ async def _write(args):
     pid = args.get("proposal_id")
     _rate_check(pid)
     state = await _maybe_auto_resolve(_load_or_err(pid))
-    if state["resolved"]:
-        raise QuorumError(
-            "proposal_closed",
-            f"proposal '{pid}' is resolved; the blackboard is sealed",
-            "read the final record with history")
     key = args.get("key")
     if not isinstance(key, str) or not key or len(key) > MAX_KEY:
         raise QuorumError("invalid_key",
@@ -769,16 +820,38 @@ async def _write(args):
                           "write requires a 'value' argument",
                           "pass any JSON-serializable value")
     try:
-        json.dumps(args["value"])
+        value_bytes = len(json.dumps(args["value"]))
     except (TypeError, ValueError):
         raise QuorumError("invalid_value",
                           "value is not JSON-serializable",
                           "pass a string, number, array, or object")
+    if value_bytes > MAX_VALUE_BYTES:
+        raise QuorumError("invalid_value",
+                          f"value serializes to {value_bytes} bytes "
+                          f"(max {MAX_VALUE_BYTES})",
+                          "store large payloads elsewhere and write "
+                          "a reference")
     author = args.get("author")
+    if author is not None and \
+            (not isinstance(author, str) or len(author) > MAX_AUTHOR):
+        raise QuorumError("invalid_author",
+                          f"author must be a string "
+                          f"(max {MAX_AUTHOR} chars)",
+                          "use a short identity string")
     data = {"key": key, "value": args["value"], "author": author}
     t0 = time.time()
-    record = await _attest({"type": "write", "proposal_id": pid, **data})
-    ev = await store.append(pid, "write", data, record)
+    # Re-check resolved under the lock: a write must not land after a
+    # resolve event that a concurrent call just appended.
+    async with store.mutation_lock(pid):
+        state = store.load(pid)
+        if state["resolved"]:
+            raise QuorumError(
+                "proposal_closed",
+                f"proposal '{pid}' is resolved; the blackboard is sealed",
+                "read the final record with history")
+        record = await _attest(
+            {"type": "write", "proposal_id": pid, **data})
+        ev = store.append_unlocked(pid, "write", data, record)
     await spans.emit(spans.write_span(
         pid, ev["seq"], key, author, args["value"], record["id"],
         t0, time.time()), _telinea_key_for(state["config"]))
@@ -811,21 +884,6 @@ async def _vote(args):
             "unknown_voter",
             f"'{voter}' is not on the expected voter list",
             "vote with one of: " + ", ".join(cfg["voters"]))
-    if voter in state["votes"]:
-        raise QuorumError(
-            "duplicate_vote",
-            f"'{voter}' has already voted; votes are immutable",
-            "the recorded vote stands -- see history")
-    if state["resolved"]:
-        raise QuorumError(
-            "proposal_closed",
-            f"proposal '{pid}' is resolved",
-            "read the outcome with resolve or history")
-    if store.deadline_passed(state):
-        raise QuorumError(
-            "deadline_passed",
-            f"the deadline {cfg['deadline']} has passed",
-            "the vote window is closed; call resolve")
     reasoning = args.get("reasoning")
     if reasoning is not None and \
             (not isinstance(reasoning, str)
@@ -837,15 +895,36 @@ async def _vote(args):
     value = _validate_vote(cfg["algorithm"], args.get("value"),
                            cfg["options"])
     data = {"voter": voter, "value": value, "reasoning": reasoning}
-    # Conformity-bias signal: early = first vote, late = cast after a
-    # majority of expected voters had already voted.
-    prior = len(state["votes"])
-    vote_timing = ("early" if prior == 0
-                   else "late" if prior > len(cfg["voters"]) / 2
-                   else "median")
     t0 = time.time()
-    record = await _attest({"type": "vote", "proposal_id": pid, **data})
-    ev = await store.append(pid, "vote", data, record)
+    # Duplicate/resolved/deadline checks and the append are one atomic
+    # section: two concurrent votes from the same voter can't both land,
+    # and no vote lands after a resolve event.
+    async with store.mutation_lock(pid):
+        state = store.load(pid)
+        if voter in state["votes"]:
+            raise QuorumError(
+                "duplicate_vote",
+                f"'{voter}' has already voted; votes are immutable",
+                "the recorded vote stands -- see history")
+        if state["resolved"]:
+            raise QuorumError(
+                "proposal_closed",
+                f"proposal '{pid}' is resolved",
+                "read the outcome with resolve or history")
+        if store.deadline_passed(state):
+            raise QuorumError(
+                "deadline_passed",
+                f"the deadline {cfg['deadline']} has passed",
+                "the vote window is closed; call resolve")
+        # Conformity-bias signal: early = first vote, late = cast after
+        # a majority of expected voters had already voted.
+        prior = len(state["votes"])
+        vote_timing = ("early" if prior == 0
+                       else "late" if prior > len(cfg["voters"]) / 2
+                       else "median")
+        record = await _attest(
+            {"type": "vote", "proposal_id": pid, **data})
+        ev = store.append_unlocked(pid, "vote", data, record)
     await spans.emit(spans.vote_span(
         pid, ev["seq"], voter, cfg["algorithm"], value, prior + 1,
         vote_timing, record["id"], t0, time.time()),
@@ -867,8 +946,22 @@ async def _resolve(args):
             f"quorum is {cfg['quorum']}%",
             "wait for more votes or the deadline, or lower quorum "
             "on a future proposal")
-    outcome = await _do_resolve(state)
+    outcome = await _do_resolve(pid)
     return _ok(outcome)
+
+
+def _sanitize_event(ev):
+    """Strip secrets before an event leaves the server: the proposal-
+    scoped Telinea blob is ciphertext, but it doesn't belong in the
+    public audit payload."""
+    data = ev.get("data")
+    if isinstance(data, dict) and "telinea_key_enc" in data:
+        ev = dict(ev)
+        data = dict(data)
+        data["telinea_key_enc"] = "[sealed]" if data[
+            "telinea_key_enc"] else None
+        ev["data"] = data
+    return ev
 
 
 async def _history(args):
@@ -876,7 +969,7 @@ async def _history(args):
     state = await _maybe_auto_resolve(_load_or_err(pid))
     filt = args.get("filter", "all")
     type_map = {"writes": "write", "votes": "vote", "outcome": "resolve"}
-    events = state["events"]
+    events = [_sanitize_event(e) for e in state["events"]]
     if filt in type_map:
         events = [e for e in events if e["type"] == type_map[filt]]
     elif filt != "all":
@@ -954,7 +1047,12 @@ async def dispatch(req):
     elif method == "prompts/list":
         result = {"prompts": []}
     elif method == "tools/call":
-        params = req.get("params") or {}
+        params = req.get("params")
+        if params is not None and not isinstance(params, dict):
+            if msg_id is None:
+                return None
+            return error_response(msg_id, -32602, "Invalid params")
+        params = params or {}
         result = await call_tool(params.get("name"),
                                  params.get("arguments"))
     else:
@@ -978,6 +1076,9 @@ def main():
             req = json.loads(line)
         except json.JSONDecodeError:
             _write_msg(error_response(None, -32700, "Parse error"))
+            continue
+        if not isinstance(req, dict):
+            _write_msg(error_response(None, -32600, "Invalid Request"))
             continue
         resp = asyncio.run(dispatch(req))
         if resp is not None:

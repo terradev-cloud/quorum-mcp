@@ -60,6 +60,10 @@ _closed_roots = set()
 # deliver).
 _detached = False
 
+# Strong refs to in-flight detached pushes -- the loop only weak-refs
+# tasks, so an unreferenced push could be GC'd before delivering.
+_bg_tasks = set()
+
 
 def set_detached(value=True):
     global _detached
@@ -305,7 +309,10 @@ async def emit(span, telinea_key=None):
     if not configured() or not telinea_key:
         return
     if _detached:
-        asyncio.get_running_loop().create_task(_push(span, telinea_key))
+        t = asyncio.get_running_loop().create_task(
+            _push(span, telinea_key))
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
     else:
         await _push(span, telinea_key)
 

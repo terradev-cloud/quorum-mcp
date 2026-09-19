@@ -50,6 +50,12 @@ def _fake_sample(server=None):
 
 
 server._stamp_sample = _fake_sample
+# stamp-mcp isn't installed in the test env: _stamp_query_time only
+# gates availability, and _stamp_canonical is the RFC 8785 form the
+# record hash covers -- a sorted compact dump is faithful enough here.
+server._stamp_query_time = lambda *a, **k: None
+server._stamp_canonical = lambda r: json.dumps(
+    r, sort_keys=True, separators=(",", ":"))
 
 
 def test_algorithms():
@@ -170,8 +176,9 @@ def test_otlp_wire_format():
     # Feed through the real ingest parser from terradev-cloud. The module
     # pulls FastAPI/SQLAlchemy/SECRET_KEY on import, so extract the pure
     # parser functions from source via ast -- same code, no dep chain.
-    import ast, base64, binascii, typing
-    from datetime import datetime as _dt, timezone as _tz
+    import ast, base64, binascii, re, typing
+    from datetime import datetime as _dt, timezone as _tz, \
+        timedelta as _td
     src = open("/Users/theowolfenden/CascadeProjects/terradev-cloud/"
                "api/terradev_cloud/routers/ingest.py").read()
     tree = ast.parse(src)
@@ -179,20 +186,34 @@ def test_otlp_wire_format():
               "_ns_to_iso", "_span_kind_name", "_status_name",
               "_iter_otlp_spans", "_map_events"}
     ns = {"json": json, "base64": base64, "binascii": binascii,
-          "datetime": _dt, "timezone": _tz,
+          "datetime": _dt, "timezone": _tz, "timedelta": _td, "re": re,
           "Any": typing.Any, "Dict": typing.Dict, "List": typing.List,
           "Optional": typing.Optional, "Tuple": typing.Tuple}
     found = set()
     for node in tree.body:
-        if isinstance(node, ast.Assign):  # module constants like _SPAN_KINDS
-            for t in node.targets:
-                if getattr(t, "id", "") == "_SPAN_KINDS":
-                    exec(compile(ast.Module([node], []), "<ing>", "exec"), ns)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            # Module constants (_SPAN_KINDS, MAX_*, _CONTROL_CHARS, ...).
+            # Skip ones whose deps we didn't import (router = APIRouter).
+            try:
+                exec(compile(ast.Module([node], []), "<ing>", "exec"), ns)
+            except Exception:
+                pass
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                and node.name in wanted:
-            exec(compile(ast.Module([node], []), "<ing>", "exec"), ns)
-            found.add(node.name)
-    check("otlp: parser functions extracted", found == wanted,
+                and node.name.startswith("_"):
+            # All private helpers: the wanted parsers may call other
+            # helpers (e.g. _clean_str) added upstream over time. The
+            # future import defers annotation evaluation so helpers
+            # annotated with FastAPI types don't need those imports.
+            mod = ast.fix_missing_locations(ast.Module(
+                [ast.ImportFrom("__future__",
+                                [ast.alias("annotations")], 0), node],
+                []))
+            try:
+                exec(compile(mod, "<ing>", "exec"), ns)
+                found.add(node.name)
+            except Exception:
+                pass
+    check("otlp: parser functions extracted", wanted <= found,
           str(wanted - found))
     _iter_otlp_spans = ns["_iter_otlp_spans"]
     _kv_list_to_dict = ns["_kv_list_to_dict"]
@@ -407,6 +428,96 @@ async def test_namespace_rate_queue():
           and len({r["attested_at"] for r in records}) == 1)
 
 
+async def test_audit_fixes():
+    # -- concurrent duplicate vote: exactly one lands --
+    out, err = await _call("propose", {
+        "name": "race-vote", "question": "q", "voters": ["v1", "v2"],
+        "deadline_minutes": 5})
+    assert not err, out
+    results = await asyncio.gather(*[
+        _call("vote", {"proposal_id": "race-vote", "voter": "v1",
+                       "value": "yes"}) for _ in range(5)])
+    oks = [r for r, e in results if not e]
+    dups = [r for r, e in results
+            if e and r["error"]["code"] == "duplicate_vote"]
+    check("race: one vote wins, rest duplicate",
+          len(oks) == 1 and len(dups) == 4,
+          f"{len(oks)} ok, {len(dups)} dup")
+    state = server.store.load("race-vote")
+    check("race: single vote event in log",
+          len([e for e in state["events"] if e["type"] == "vote"]) == 1)
+
+    # -- concurrent resolve: exactly one resolve event --
+    await _call("vote", {"proposal_id": "race-vote", "voter": "v2",
+                         "value": "yes"})
+    results = await asyncio.gather(*[
+        _call("resolve", {"proposal_id": "race-vote"})
+        for _ in range(5)])
+    check("race: all resolves return outcome",
+          all(not e and r["status"] == "decided" for r, e in results))
+    state = server.store.load("race-vote")
+    check("race: single resolve event in log",
+          len([e for e in state["events"] if e["type"] == "resolve"])
+          == 1)
+
+    # -- concurrent propose same name: one wins --
+    results = await asyncio.gather(*[
+        _call("propose", {"name": "race-prop", "question": "q",
+                          "voters": ["v1"], "deadline_minutes": 5})
+        for _ in range(4)])
+    oks = [r for r, e in results if not e]
+    exists = [r for r, e in results
+              if e and r["error"]["code"] == "proposal_exists"]
+    check("race: one propose wins, rest exist",
+          len(oks) == 1 and len(exists) == 3,
+          f"{len(oks)} ok, {len(exists)} exist")
+
+    # -- history redacts the sealed telinea blob --
+    out, err = await _call("register", {
+        "api_key": "audit-key-12345", "telinea_key": "tel-secret"})
+    check("register for redaction test", not err, str(out))
+    out, err = await _call("propose", {
+        "api_key": "audit-key-12345", "name": "redact-prop",
+        "question": "q", "voters": ["v1"], "deadline_minutes": 5})
+    check("keyed propose works (blob field fix)", not err, str(out))
+    out, err = await _call("history", {"proposal_id": "redact-prop"})
+    blob = out["events"][0]["data"].get("telinea_key_enc")
+    check("history redacts telinea_key_enc", blob == "[sealed]",
+          str(blob))
+
+    # -- size caps --
+    out, err = await _call("write", {
+        "proposal_id": "redact-prop", "key": "big",
+        "value": "x" * 70_000})
+    check("oversize value rejected", err
+          and out["error"]["code"] == "invalid_value")
+    out, err = await _call("propose", {
+        "name": "big-q", "question": "q" * 5000,
+        "voters": ["v1"], "deadline_minutes": 5})
+    check("oversize question rejected", err
+          and out["error"]["code"] == "invalid_question")
+
+    # -- attest worker survives a bad payload --
+    class Unserializable:
+        pass
+    try:
+        await server._attest({"bad": Unserializable()})
+        check("bad payload raises", False)
+    except Exception:
+        check("bad payload raises", True)
+    rec = await server._attest({"type": "ok"})
+    check("worker alive after bad payload", "sha256" in rec)
+
+    # -- cross-loop appends (stdio runs one loop per message) --
+    def other_loop_append():
+        asyncio.run(server.store.append(
+            "race-prop", "write", {"key": "k", "value": 1}, None))
+    await asyncio.to_thread(other_loop_append)
+    state = server.store.load("race-prop")
+    check("append from a different loop works",
+          any(e["type"] == "write" for e in state["events"]))
+
+
 def main():
     print("\n-- algorithms --")
     test_algorithms()
@@ -420,6 +531,8 @@ def main():
     asyncio.run(test_lifecycle())
     print("\n-- namespace + rate limit + attestation queue --")
     asyncio.run(test_namespace_rate_queue())
+    print("\n-- audit fixes: races, redaction, caps, worker survival --")
+    asyncio.run(test_audit_fixes())
     print()
     shutil.rmtree(_TMP, ignore_errors=True)
     if errors:

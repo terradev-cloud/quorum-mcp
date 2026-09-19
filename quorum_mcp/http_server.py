@@ -152,23 +152,36 @@ async def handle_sse_post(request):
     raise web.HTTPTemporaryRedirect("/mcp", headers=_CORS)
 
 
+# Open SSE streams are held indefinitely -- cap them so a flood of
+# GET /mcp connections can't exhaust sockets/tasks.
+_sse_open = 0
+_MAX_SSE = 256
+
+
 async def handle_mcp_get(request):
     """SSE channel: clients that expect a streamable endpoint open GET
     /mcp and hold it. We send a keep-alive comment and hold the socket."""
+    global _sse_open
+    if _sse_open >= _MAX_SSE:
+        return web.Response(status=503, headers=_CORS,
+                            text="too many open streams")
+    _sse_open += 1
     resp = web.StreamResponse(
         status=200,
         headers={**_CORS,
                  "Content-Type": "text/event-stream",
                  "Cache-Control": "no-cache",
                  "Connection": "keep-alive"})
-    await resp.prepare(request)
     try:
+        await resp.prepare(request)
         await resp.write(b": quorum-mcp SSE channel open\n\n")
         while True:
             await asyncio.sleep(30)
             await resp.write(b": keep-alive\n\n")
     except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
         pass
+    finally:
+        _sse_open -= 1
     return resp
 
 
@@ -185,12 +198,14 @@ async def handle_mcp(request):
                            "Not Acceptable: this endpoint speaks "
                            "application/json"),
             status=406)
-    async with sem:
-        body = await _read_json(request)
-        if body is None:
-            return _json_response(
-                error_response(None, -32700, "Parse error"), status=400)
+    # Read the body BEFORE taking a dispatch slot: a slow upload must
+    # not hold a semaphore slot and starve real requests.
+    body = await _read_json(request)
+    if body is None:
+        return _json_response(
+            error_response(None, -32700, "Parse error"), status=400)
 
+    async with sem:
         if isinstance(body, list):
             responses = []
             for m in body:

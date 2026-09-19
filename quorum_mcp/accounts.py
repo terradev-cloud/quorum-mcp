@@ -33,10 +33,13 @@ its credential bridge).
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
+import threading
 import time
+from collections import OrderedDict
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -59,8 +62,28 @@ _DATA_KEY = os.environ.get("QUORUM_DATA_KEY", "").strip()
 _HKDF_INFO = b"quorum-mcp/telinea-key-v1"
 _HKDF_INFO_DATA = b"quorum-mcp/data-key-v1"
 
-# proposal_id -> plaintext telinea key (populated at propose time)
-_key_cache = {}
+# Decrypted Telinea keys live only in process memory, keyed by proposal
+# id. Never written to disk plaintext. Bounded LRU: plaintext keys are
+# high-value, so the cache can't grow without limit.
+_KEY_CACHE_MAX = 1024
+_key_cache = OrderedDict()
+
+# Serializes the accounts.json read-modify-write in register() -- two
+# concurrent registrations must not clobber each other.
+_register_lock = threading.Lock()
+
+# A well-formed blob under a throwaway key, built lazily. unlock()
+# decrypts it when the account doesn't exist so the missing-account
+# path costs the same HKDF+GCM work as the wrong-key path -- account
+# existence isn't oracle-able by timing.
+_dummy_blob = None
+
+
+def _get_dummy_blob():
+    global _dummy_blob
+    if _dummy_blob is None:
+        _dummy_blob = _seal(os.urandom(32), b"timing-equalization")
+    return _dummy_blob
 
 
 def available():
@@ -115,24 +138,23 @@ def _save_accounts(accounts):
 
 
 def register(quorum_key, telinea_key):
-    """Create or replace an account. Returns the account_id.
-
-    The Quorum key is used to derive the KEK and is then discarded --
-    only its sha256 (as account_id) and the encrypted blob persist.
-    """
-    if not _HAS_CRYPTO:
-        raise RuntimeError("cryptography package is not installed")
-    salt = secrets.token_bytes(16)
-    blob = _seal(_kek(quorum_key, salt), telinea_key)
-    account_id = account_id_for(quorum_key)
-    accounts = _load_accounts()
-    accounts[account_id] = {
-        "salt": base64.b64encode(salt).decode(),
-        "telinea_key_enc": blob,
-        "created_at": time.time(),
-    }
-    _save_accounts(accounts)
+    """Store telinea_key encrypted under a key derived from quorum_key.
+    Returns the account id."""
+    with _register_lock:
+        accounts = _load_accounts()
+        account_id = account_id_for(quorum_key)
+        salt = os.urandom(32)
+        accounts[account_id] = {
+            "salt": base64.b64encode(salt).decode(),
+            "blob": _seal(_kek(quorum_key, salt), telinea_key),
+        }
+        _save_accounts(accounts)
     return account_id
+
+
+def count():
+    """Registered account count -- used to cap growth."""
+    return len(_load_accounts())
 
 
 def unlock(quorum_key):
@@ -146,11 +168,18 @@ def unlock(quorum_key):
     account_id = account_id_for(quorum_key)
     rec = _load_accounts().get(account_id)
     if rec is None:
+        # Same HKDF+GCM work as the wrong-key path: account existence
+        # stays indistinguishable by timing.
+        try:
+            _open(_kek(quorum_key, b"\x00" * 32), _get_dummy_blob())
+        except Exception:
+            pass
         return None
     try:
         salt = base64.b64decode(rec["salt"])
-        return account_id, _open(_kek(quorum_key, salt),
-                                 rec["telinea_key_enc"])
+        # Field was "blob" in early accounts.json files; accept both.
+        blob = rec.get("telinea_key_enc") or rec.get("blob")
+        return account_id, _open(_kek(quorum_key, salt), blob)
     except Exception:
         return None
 
@@ -162,6 +191,9 @@ def unlock(quorum_key):
 
 def cache_key(proposal_id, telinea_key):
     _key_cache[proposal_id] = telinea_key
+    _key_cache.move_to_end(proposal_id)
+    while len(_key_cache) > _KEY_CACHE_MAX:
+        _key_cache.popitem(last=False)
 
 
 def seal_for_proposal(telinea_key):
@@ -176,12 +208,13 @@ def resolve_key(proposal_id, proposal_blob):
     proposal-scoped blob under the server data key. None if neither."""
     key = _key_cache.get(proposal_id)
     if key:
+        _key_cache.move_to_end(proposal_id)
         return key
     dk = _data_key()
     if dk and proposal_blob:
         try:
             key = _open(dk, proposal_blob)
-            _key_cache[proposal_id] = key
+            cache_key(proposal_id, key)
             return key
         except Exception:
             return None
