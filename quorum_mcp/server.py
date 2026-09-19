@@ -76,13 +76,22 @@ MAX_ACCOUNTS = int(os.environ.get("QUORUM_MAX_ACCOUNTS", "10000"))
 TOOLS = [
     {
         "name": "register",
-        "description": "One-time account setup: bind a Quorum API key to "
-                       "a Telinea API key. The Telinea key is stored "
-                       "encrypted under a key derived from the Quorum "
-                       "key (AES-256-GCM, HKDF) -- the Quorum key itself "
-                       "is never stored. Every span for this account's "
-                       "proposals is then pushed with the stored "
-                       "Telinea key, standard OTLP bearer auth.",
+        "description": "OPTIONAL one-time setup -- only needed if you "
+                       "want proposal telemetry (OTLP spans) pushed to "
+                       "your Telinea account. Call once before propose: "
+                       "it binds an api_key you choose to your Telinea "
+                       "API key. Afterwards, pass the same api_key on "
+                       "propose and every span for that proposal is "
+                       "pushed to your Telinea with standard OTLP "
+                       "bearer auth. Storage: the Telinea key is sealed "
+                       "with AES-256-GCM under a key derived from your "
+                       "api_key (HKDF-SHA256, per-account salt); only "
+                       "sha256(api_key) is kept as the lookup id, so "
+                       "neither key is ever stored in the clear. "
+                       "Re-registering with the same api_key rotates "
+                       "the stored Telinea key. Skip this tool entirely "
+                       "for anonymous use -- propose works without an "
+                       "api_key, just with no span streaming.",
         "inputSchema": {
             "type": "object",
             "properties": {
