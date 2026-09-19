@@ -39,10 +39,26 @@ _CORS = {
 }
 
 
-def _json_response(payload, status=200):
+def _json_response(payload, status=200, cache=False):
+    headers = dict(_CORS)
+    if cache:
+        headers["Cache-Control"] = "public, max-age=3600"
     return web.Response(
         text=json.dumps(payload), status=status,
-        content_type="application/json", headers=_CORS)
+        content_type="application/json", headers=headers)
+
+
+def _accept_ok(request):
+    """Accept-header relaxation: take anything reasonable, reject only
+    explicitly incompatible types. The 406 bug that cost days on Stamp
+    was a strict check -- clients send Accept: */*, application/json,
+    text/event-stream, or nothing at all. Only a pure text/html-style
+    accept is genuinely incompatible with a JSON-RPC endpoint."""
+    accept = request.headers.get("Accept", "")
+    if not accept or "*/*" in accept:
+        return True
+    return any(t in accept for t in (
+        "application/json", "text/event-stream", "application/*"))
 
 
 async def _read_json(request):
@@ -111,7 +127,7 @@ async def handle_v1_info(request):
             "description": "OTLP endpoint for Telinea span ingestion.",
         },
         "docs": "https://terradev.cloud/docs",
-    })
+    }, cache=True)
 
 
 async def handle_agent_card(request):
@@ -123,11 +139,17 @@ async def handle_agent_card(request):
         "skills": [t["name"] for t in TOOLS],
         "version": __version__,
         "authentication": None,
-    })
+    }, cache=True)
 
 
 async def handle_mcp_options(request):
     return web.Response(status=204, headers=_CORS)
+
+
+async def handle_sse_post(request):
+    """POST /sse -> 307 to /mcp. 307 not 308: some clients downgrade
+    POST to GET on permanent redirects; 307 preserves method and body."""
+    raise web.HTTPTemporaryRedirect("/mcp", headers=_CORS)
 
 
 async def handle_mcp_get(request):
@@ -157,6 +179,12 @@ async def _dispatch_one(m):
 
 
 async def handle_mcp(request):
+    if not _accept_ok(request):
+        return _json_response(
+            error_response(None, -32600,
+                           "Not Acceptable: this endpoint speaks "
+                           "application/json"),
+            status=406)
     async with sem:
         body = await _read_json(request)
         if body is None:
@@ -190,6 +218,8 @@ def main():
     app.router.add_get("/v1/info", handle_v1_info)
     app.router.add_get("/.well-known/agent.json", handle_agent_card)
     app.router.add_get("/.well-known/agent-card.json", handle_agent_card)
+    # Neuronto and other crawlers ask for ard.json -- serve the card.
+    app.router.add_get("/.well-known/ard.json", handle_agent_card)
     app.router.add_get("/.well-known/oauth-protected-resource",
                        handle_protected_resource_metadata)
     app.router.add_get("/.well-known/oauth-protected-resource/",
@@ -201,6 +231,11 @@ def main():
     app.router.add_get("/mcp", handle_mcp_get)
     app.router.add_post("/mcp", handle_mcp)
     app.router.add_post("/mcp/", handle_mcp)
+    # /sse compatibility: some clients POST here expecting the old SSE
+    # transport -- 307 preserves method+body into the /mcp handler.
+    app.router.add_route("OPTIONS", "/sse", handle_mcp_options)
+    app.router.add_get("/sse", handle_mcp_get)
+    app.router.add_post("/sse", handle_sse_post)
 
     # Persistent loop: emit spans as background tasks, not inline awaits.
     spans.set_detached(True)
