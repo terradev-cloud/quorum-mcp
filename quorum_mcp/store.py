@@ -32,14 +32,23 @@ _locks = {}
 _locks_guard = asyncio.Lock()
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# Namespaced ids: <namespace>:<name> -- one colon, each segment follows
+# the same charset. Namespaces isolate tenants on disk and in ops.
+_NS_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def valid_id(proposal_id):
-    """Proposal ids double as filenames -- restrict to safe characters."""
-    return isinstance(proposal_id, str) and bool(_ID_RE.match(proposal_id))
+    """Proposal ids double as filenames -- restrict to safe characters.
+    Accepts flat 'name' or namespaced 'ns:name'."""
+    return isinstance(proposal_id, str) and bool(
+        _ID_RE.match(proposal_id) or _NS_ID_RE.match(proposal_id))
 
 
 def _path(proposal_id):
+    if ":" in proposal_id:
+        ns, name = proposal_id.split(":", 1)
+        return os.path.join(DATA_DIR, ns, name + ".jsonl")
     return os.path.join(DATA_DIR, proposal_id + ".jsonl")
 
 
@@ -65,7 +74,7 @@ async def append(proposal_id, event_type, data, attestation):
             pass
         event = {"seq": seq, "type": event_type, "at": time.time(),
                  "attestation": attestation, "data": data}
-        os.makedirs(DATA_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(_path(proposal_id)), exist_ok=True)
         with open(_path(proposal_id), "a") as f:
             f.write(json.dumps(event) + "\n")
         return event

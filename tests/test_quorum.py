@@ -38,19 +38,18 @@ def check(label, cond, detail=""):
         errors += 1
 
 
-# Fast local attestation: same record shape as Stamp, no NTP.
-def _fake_attest(payload, server=None):
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return {
-        "id": str(uuid.uuid4()),
-        "attested_at": "2026-09-18T00:00:00+00:00",
-        "time_source": "local",
-        "payload": payload,
-        "sha256": hashlib.sha256(canonical.encode()).hexdigest(),
-    }
+# Fast local time sample: the queue builds real Stamp records (real
+# _canonical sha256) from this stubbed sample -- no NTP, full fidelity.
+_sample_calls = [0]
 
 
-server._stamp_attest = _fake_attest
+def _fake_sample(server=None):
+    _sample_calls[0] += 1
+    return {"attested_at": "2026-09-18T00:00:00+00:00",
+            "time_source": "local"}
+
+
+server._stamp_sample = _fake_sample
 
 
 def test_algorithms():
@@ -341,6 +340,73 @@ async def test_lifecycle():
     check("not found", err and out["error"]["code"] == "proposal_not_found")
 
 
+async def test_namespace_rate_queue():
+    # -- namespace: ns:name ids, isolated on disk --
+    out, err = await _call("propose", {
+        "name": "deploy-1", "namespace": "team-a",
+        "question": "Deploy?", "voters": ["v1"], "deadline_minutes": 5})
+    check("namespaced propose", not err
+          and out["proposal_id"] == "team-a:deploy-1", str(out))
+    ns_path = os.path.join(os.environ["QUORUM_DATA_DIR"],
+                           "team-a", "deploy-1.jsonl")
+    check("namespace subdir on disk", os.path.exists(ns_path), ns_path)
+    # same name in a different namespace doesn't collide
+    out, err = await _call("propose", {
+        "name": "deploy-1", "namespace": "team-b",
+        "question": "Deploy?", "voters": ["v1"], "deadline_minutes": 5})
+    check("same name, other namespace ok",
+          not err and out["proposal_id"] == "team-b:deploy-1", str(out))
+    out, err = await _call("vote", {
+        "proposal_id": "team-a:deploy-1", "voter": "v1", "value": "yes"})
+    check("vote on namespaced id", not err and out["accepted"])
+    out, err = await _call("propose", {
+        "name": "bad:name", "question": "q", "voters": ["v1"],
+        "deadline_minutes": 5})
+    check("colon in name rejected", err
+          and out["error"]["code"] == "invalid_name")
+
+    # -- per-proposal rate limit --
+    server._rate_windows.clear()
+    old_rate = server._RATE_PER_MIN
+    server._RATE_PER_MIN = 3
+    try:
+        await _call("propose", {
+            "name": "rate-prop", "question": "q", "voters": ["v1"],
+            "deadline_minutes": 5})
+        for i in range(3):
+            out, err = await _call("write", {
+                "proposal_id": "rate-prop", "key": f"k{i}",
+                "value": i, "author": "a"})
+            assert not err, out
+        out, err = await _call("write", {
+            "proposal_id": "rate-prop", "key": "k4",
+            "value": 4, "author": "a"})
+        check("rate_limited at cap", err
+              and out["error"]["code"] == "rate_limited", str(out))
+        # a different proposal is unaffected
+        await _call("propose", {
+            "name": "rate-prop-2", "question": "q", "voters": ["v1"],
+            "deadline_minutes": 5})
+        out, err = await _call("write", {
+            "proposal_id": "rate-prop-2", "key": "k", "value": 1})
+        check("other proposal unaffected", not err)
+    finally:
+        server._RATE_PER_MIN = old_rate
+        server._rate_windows.clear()
+
+    # -- attestation queue coalescing: N concurrent attests -> 1 sample --
+    _sample_calls[0] = 0
+    payloads = [{"type": "write", "i": i} for i in range(8)]
+    records = await asyncio.gather(*[server._attest(p) for p in payloads])
+    check("queue: all fulfilled", len(records) == 8
+          and all("sha256" in r and "id" in r for r in records))
+    check("queue: coalesced to 1 sample", _sample_calls[0] == 1,
+          str(_sample_calls[0]))
+    check("queue: unique ids, shared sample",
+          len({r["id"] for r in records}) == 8
+          and len({r["attested_at"] for r in records}) == 1)
+
+
 def main():
     print("\n-- algorithms --")
     test_algorithms()
@@ -352,6 +418,8 @@ def main():
     test_otlp_wire_format()
     print("\n-- lifecycle (register -> propose -> write -> vote -> resolve -> history) --")
     asyncio.run(test_lifecycle())
+    print("\n-- namespace + rate limit + attestation queue --")
+    asyncio.run(test_namespace_rate_queue())
     print()
     shutil.rmtree(_TMP, ignore_errors=True)
     if errors:

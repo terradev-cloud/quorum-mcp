@@ -35,9 +35,13 @@ reachable.
 """
 
 import asyncio
+import hashlib
 import json
+import os
 import sys
 import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
 
 from quorum_mcp import __version__
@@ -45,9 +49,12 @@ from quorum_mcp import accounts, spans, store
 from quorum_mcp.algorithms import ALGORITHMS, aggregate
 
 try:
-    from stamp_mcp.server import attest as _stamp_attest
+    from stamp_mcp.server import (
+        query_time as _stamp_query_time,
+        _canonical as _stamp_canonical)
 except ImportError:  # pragma: no cover -- stamp-mcp is a hard dependency
-    _stamp_attest = None
+    _stamp_query_time = None
+    _stamp_canonical = None
 
 NTP_SERVER = "time.cloudflare.com"
 
@@ -112,6 +119,14 @@ TOOLS = [
                                    "pr-review-2026-09-18. Letters, "
                                    "digits, . _ - only; becomes the key "
                                    "for all subsequent calls.",
+                },
+                "namespace": {
+                    "type": "string",
+                    "description": "Optional tenant namespace. The "
+                                   "proposal id becomes "
+                                   "'<namespace>:<name>' -- different "
+                                   "teams can reuse names without "
+                                   "colliding. Same charset as name.",
                 },
                 "question": {
                     "type": "string",
@@ -286,20 +301,112 @@ def _ok(payload):
 
 # ---------------------------------------------------------------------------
 # Attestation: every event is stamped. stamp-mcp is a hard dependency --
-# its attest() produces the sha256-over-JCS record with an NTP-verified
-# timestamp (local clock fallback disclosed in the record).
+# its record shape (sha256-over-JCS, NTP-verified timestamp, local-clock
+# fallback disclosed in the record) is preserved exactly.
+#
+# Async queue: N concurrent tool calls coalesce onto ONE NTP query per
+# drain batch instead of one query per event. Each event still gets its
+# own record -- unique id, own payload hash -- built from the shared
+# sample. Throughput stops being bound by NTP round-trips.
 # ---------------------------------------------------------------------------
 
+_attest_q = None
+_attest_worker = None
+_attest_loop = None
+
+
+def _stamp_sample(server):
+    """One NTP time sample, shared by a drain batch of attestations."""
+    ntp = _stamp_query_time(server)
+    return {"attested_at": ntp["utc"], "time_source": "ntp",
+            "time_server": ntp["server"],
+            "clock_offset_ms": ntp["offset_ms"]}
+
+
+def _stamp_record(payload, sample):
+    """Build one attestation record from a shared sample -- identical
+    shape to stamp's attest(), so `stamp verify` still validates it."""
+    record = {"id": str(uuid.uuid4()), **sample, "payload": payload}
+    record["sha256"] = hashlib.sha256(
+        _stamp_canonical(record).encode()).hexdigest()
+    return record
+
+
+async def _attest_drain(q):
+    """Queue worker: pull one item, coalesce whatever else queued up,
+    take ONE time sample, fulfill every waiter with its own record."""
+    while True:
+        payload, fut = await q.get()
+        batch = [(payload, fut)]
+        while True:
+            try:
+                batch.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        try:
+            sample = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None, _stamp_sample, NTP_SERVER),
+                timeout=15.0)
+        except Exception:
+            # NTP unreachable/slow: local-clock fallback, disclosed in
+            # every record -- same semantics as stamp's attest().
+            sample = {
+                "attested_at": datetime.now(timezone.utc).isoformat(),
+                "time_source": "local",
+            }
+        for p, f in batch:
+            if not f.done():
+                f.set_result(_stamp_record(p, sample))
+
+
+def _attest_queue():
+    """The queue and its worker are bound to the loop that created them;
+    a new loop (stdio re-entry, tests) gets a fresh pair."""
+    global _attest_q, _attest_worker, _attest_loop
+    loop = asyncio.get_running_loop()
+    if _attest_q is None or _attest_loop is not loop:
+        _attest_q = asyncio.Queue()
+        _attest_worker = None
+        _attest_loop = loop
+    if _attest_worker is None or _attest_worker.done():
+        _attest_worker = asyncio.ensure_future(_attest_drain(_attest_q))
+    return _attest_q
+
+
 async def _attest(payload):
-    if _stamp_attest is None:
+    if _stamp_query_time is None:
         raise QuorumError(
             "attestation_unavailable",
             "stamp-mcp is not installed; cannot attest",
             "pip install stamp-mcp and restart quorum")
-    loop = asyncio.get_running_loop()
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, _stamp_attest, payload, NTP_SERVER),
-        timeout=15.0)
+    fut = asyncio.get_running_loop().create_future()
+    _attest_queue().put_nowait((payload, fut))
+    return await fut
+
+
+# ---------------------------------------------------------------------------
+# Per-proposal rate limit: sliding window over mutating events (write,
+# vote). One hot proposal can't starve the rest; Caddy's per-IP zone is
+# now only a coarse backstop. QUORUM_PROPOSAL_RATE overrides.
+# ---------------------------------------------------------------------------
+
+_RATE_PER_MIN = int(os.environ.get("QUORUM_PROPOSAL_RATE", "120"))
+_rate_windows = {}  # proposal_id -> deque of monotonic timestamps
+
+
+def _rate_check(proposal_id):
+    now = time.monotonic()
+    dq = _rate_windows.setdefault(proposal_id, deque())
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= _RATE_PER_MIN:
+        raise QuorumError(
+            "rate_limited",
+            f"proposal '{proposal_id}' exceeded "
+            f"{_RATE_PER_MIN} events/min",
+            "slow down, or raise QUORUM_PROPOSAL_RATE on the server")
+    dq.append(now)
 
 
 # ---------------------------------------------------------------------------
@@ -528,12 +635,21 @@ async def _propose(args):
                 "first, or omit api_key for anonymous use")
         account_id, telinea_key = unlocked
     name = args.get("name")
-    if not store.valid_id(name):
+    if not store.valid_id(name) or ":" in name:
         raise QuorumError(
             "invalid_name",
             "name must be 1-128 chars of [A-Za-z0-9._-], "
             "starting with a letter or digit",
             "pick a descriptive id like pr-review-2026-09-18")
+    namespace = args.get("namespace")
+    if namespace is not None:
+        if not store.valid_id(namespace) or ":" in namespace or \
+                len(namespace) > 64:
+            raise QuorumError(
+                "invalid_namespace",
+                "namespace must be 1-64 chars of [A-Za-z0-9._-]",
+                "use a short tenant id like team-a or acme")
+        name = f"{namespace}:{name}"
     if store.exists(name):
         raise QuorumError(
             "proposal_exists",
@@ -601,6 +717,7 @@ async def _propose(args):
         "telinea_key_enc": (accounts.seal_for_proposal(telinea_key)
                             if telinea_key else None),
         "proposal_id": name,
+        "namespace": namespace,
         "question": question,
         "description": args.get("description"),
         "options": options,
@@ -634,6 +751,7 @@ async def _propose(args):
 
 async def _write(args):
     pid = args.get("proposal_id")
+    _rate_check(pid)
     state = await _maybe_auto_resolve(_load_or_err(pid))
     if state["resolved"]:
         raise QuorumError(
@@ -684,6 +802,7 @@ async def _read(args):
 
 async def _vote(args):
     pid = args.get("proposal_id")
+    _rate_check(pid)
     state = await _maybe_auto_resolve(_load_or_err(pid))
     cfg = state["config"]
     voter = args.get("voter")

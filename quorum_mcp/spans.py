@@ -142,6 +142,7 @@ def root_span_close(proposal_id, cfg, attestation_id, opened_ts,
 def _root_attrs(cfg, attestation_id):
     return {
         "quorum.algorithm": cfg["algorithm"],
+        "quorum.namespace": cfg.get("namespace"),
         "quorum.question": cfg["question"],
         "quorum.expected_voters": len(cfg["voters"]),
         "quorum.quorum_pct": cfg["quorum"],

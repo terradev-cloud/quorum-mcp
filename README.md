@@ -37,10 +37,12 @@ Quorum is the complete primitive: algorithm plus state plus provenance.
   `question`, `voters` (expected identities), `deadline_minutes`.
   Optional: `api_key` (from register — binds the proposal to your
   Telinea account for span streaming; omit for anonymous use),
-  `options` (default `["yes","no"]`), `algorithm` (default
-  `approval`), `quorum` (min % of voters, default 100), `threshold`
-  (supermajority share, default 66.67), `description`. Returns the
-  proposal id, creation attestation id, deadline, and blackboard URI.
+  `namespace` (tenant prefix — the id becomes `ns:name`, so different
+  teams can reuse names without colliding), `options` (default
+  `["yes","no"]`), `algorithm` (default `approval`), `quorum` (min %
+  of voters, default 100), `threshold` (supermajority share, default
+  66.67), `description`. Returns the proposal id, creation attestation
+  id, deadline, and blackboard URI.
 
 - **`write`** — append `key`/`value` to the proposal's blackboard, with
   optional `author`. Writes are appended, never replaced — the full
@@ -123,12 +125,24 @@ Config: `TELINEA_INGEST_URL` (default
 
 Concurrency capped at 100 simultaneous `POST /mcp` via `asyncio.Semaphore`.
 
+Rate limiting is **per-proposal**: `write` and `vote` are capped at
+`QUORUM_PROPOSAL_RATE` events/min per proposal id (default 120), so one
+hot proposal can't starve the rest. The edge per-IP zone in Caddy is a
+coarse backstop only.
+
+Attestation is **queued and coalesced**: concurrent events share one
+NTP sample per drain batch instead of one query per event — each event
+still gets its own Stamp record (unique id, own payload hash), so
+throughput isn't bound by NTP round-trips.
+
 ## State
 
 Event-sourced: one append-only JSONL file per proposal under
-`~/.quorum/proposals` (override `QUORUM_DATA_DIR`). The log *is* the
-history — `history` is a filtered read of the same file the tools
-append to. Nothing is rewritten or deleted.
+`~/.quorum/proposals` (override `QUORUM_DATA_DIR`). Namespaced
+proposals live in per-namespace subdirectories
+(`proposals/<ns>/<name>.jsonl`). The log *is* the history — `history`
+is a filtered read of the same file the tools append to. Nothing is
+rewritten or deleted.
 
 ## Self-hosting
 
