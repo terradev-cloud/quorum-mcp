@@ -33,10 +33,11 @@ Quorum is the complete primitive: algorithm plus state plus provenance.
   proposals is then pushed with your Telinea key, standard OTLP bearer
   auth.
 
-- **`propose`** — open a proposal: `api_key` (from register), `name`
-  (becomes the proposal id),
+- **`propose`** — open a proposal: `name` (becomes the proposal id),
   `question`, `voters` (expected identities), `deadline_minutes`.
-  Optional: `options` (default `["yes","no"]`), `algorithm` (default
+  Optional: `api_key` (from register — binds the proposal to your
+  Telinea account for span streaming; omit for anonymous use),
+  `options` (default `["yes","no"]`), `algorithm` (default
   `approval`), `quorum` (min % of voters, default 100), `threshold`
   (supermajority share, default 66.67), `description`. Returns the
   proposal id, creation attestation id, deadline, and blackboard URI.

@@ -240,6 +240,15 @@ async def test_lifecycle():
           set(names) == {"register", "propose", "write", "read", "vote",
                          "resolve", "history"}, str(names))
 
+    # Anonymous propose: no api_key -> works, no account binding
+    out, err = await _call("propose", {
+        "name": "anon-prop", "question": "Anonymous ok?",
+        "voters": ["a"], "deadline_minutes": 5})
+    check("anonymous propose ok",
+          not err and out["proposal_id"] == "anon-prop"
+          and "attestation_id" in out, str(out))
+
+    # Provided-but-unregistered key still errors loudly
     out, err = await _call("propose", {
         "api_key": "nope-key-123", "name": "x", "question": "q",
         "voters": ["a"], "deadline_minutes": 5})

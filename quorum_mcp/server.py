@@ -100,9 +100,11 @@ TOOLS = [
             "properties": {
                 "api_key": {
                     "type": "string",
-                    "description": "Your Quorum API key (from register). "
-                                   "Binds the proposal to your account "
-                                   "so its spans push to your Telinea.",
+                    "description": "Optional. Your Quorum API key (from "
+                                   "register). Binds the proposal to "
+                                   "your account so its spans push to "
+                                   "your Telinea. Omit for anonymous "
+                                   "use -- everything works, no spans.",
                 },
                 "name": {
                     "type": "string",
@@ -155,7 +157,7 @@ TOOLS = [
                     "description": "Optional context for the audit trail.",
                 },
             },
-            "required": ["api_key", "name", "question", "voters",
+            "required": ["name", "question", "voters",
                          "deadline_minutes"],
         },
     },
@@ -505,19 +507,26 @@ async def _register(args):
 
 
 async def _propose(args):
+    # api_key is optional: Quorum is open -- the proposal id is the
+    # capability. A key only binds the proposal to a Telinea account for
+    # span streaming. A provided-but-unregistered key errors loudly
+    # (likely a typo) rather than silently dropping telemetry.
+    account_id, telinea_key = None, None
     api_key = args.get("api_key")
-    if not isinstance(api_key, str) or not api_key:
-        raise QuorumError(
-            "api_key_required",
-            "propose requires your Quorum api_key",
-            "call register once, then pass api_key on propose")
-    unlocked = accounts.unlock(api_key)
-    if unlocked is None:
-        raise QuorumError(
-            "unknown_api_key",
-            "api_key not recognized",
-            "call register with this api_key and your telinea_key first")
-    account_id, telinea_key = unlocked
+    if api_key is not None:
+        if not isinstance(api_key, str) or not api_key:
+            raise QuorumError(
+                "invalid_api_key",
+                "api_key must be a non-empty string",
+                "pass the key from register, or omit it entirely")
+        unlocked = accounts.unlock(api_key)
+        if unlocked is None:
+            raise QuorumError(
+                "unknown_api_key",
+                "api_key not recognized",
+                "call register with this api_key and your telinea_key "
+                "first, or omit api_key for anonymous use")
+        account_id, telinea_key = unlocked
     name = args.get("name")
     if not store.valid_id(name):
         raise QuorumError(
@@ -588,7 +597,9 @@ async def _propose(args):
         "account_id": account_id,
         # Proposal-scoped re-encryption under the server data key so
         # spans can authenticate after restart without the Quorum key.
-        "telinea_key_enc": accounts.seal_for_proposal(telinea_key),
+        # None for anonymous proposals -- no spans are emitted.
+        "telinea_key_enc": (accounts.seal_for_proposal(telinea_key)
+                            if telinea_key else None),
         "proposal_id": name,
         "question": question,
         "description": args.get("description"),
@@ -604,7 +615,8 @@ async def _propose(args):
     }
     record = await _attest({"type": "propose", **cfg})
     await store.append(name, "propose", cfg, record)
-    accounts.cache_key(name, telinea_key)
+    if telinea_key:
+        accounts.cache_key(name, telinea_key)
     # Root span opens now; it closes at resolve or deadline expiry.
     await spans.emit(spans.root_span_open(name, cfg, record["id"]),
                      telinea_key)
