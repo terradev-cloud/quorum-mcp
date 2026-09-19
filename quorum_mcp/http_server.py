@@ -239,8 +239,11 @@ def main():
 
     # Persistent loop: emit spans as background tasks, not inline awaits.
     spans.set_detached(True)
+    # 0.0.0.0: inside the container, loopback is unreachable from Caddy
+    # on the docker network. QUORUM_HOST=127.0.0.1 for local-only dev.
+    host = os.environ.get("QUORUM_HOST", "0.0.0.0")
     port = int(os.environ.get("QUORUM_PORT", "8000"))
-    web.run_app(app, host="127.0.0.1", port=port, print=None)
+    web.run_app(app, host=host, port=port, print=None)
 
 
 if __name__ == "__main__":
