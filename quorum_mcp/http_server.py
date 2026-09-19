@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+Streamable-HTTP transport for quorum -- the same async dispatch() as the
+stdio server, served over HTTP. Uses aiohttp for async concurrency.
+
+MCP streamable-HTTP in miniature:
+
+    POST /mcp  with a JSON-RPC body  -> 200 application/json response
+    POST with only notifications     -> 202 Accepted, empty body
+    GET  /mcp                        -> 200 text/event-stream (SSE keep-alive)
+    POST /                           -> same dispatch as /mcp (alias)
+    GET  /                           -> service identity JSON
+    GET  /health                     -> 200 for the reverse proxy / monitors
+
+TLS is NOT done here. This binds to localhost and a reverse proxy
+(Caddy, nginx) terminates HTTPS in front of it. See deploy/.
+
+The endpoint is public -- no authentication.
+"""
+
+import asyncio
+import json
+import os
+
+from aiohttp import web
+
+from quorum_mcp import __version__
+from quorum_mcp import spans
+from quorum_mcp.server import TOOLS, dispatch, error_response
+
+# Cap concurrent POST /mcp work. /health and GET / are exempt -- they
+# must stay responsive when the server is saturated.
+sem = asyncio.Semaphore(100)
+
+_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
+
+def _json_response(payload, status=200):
+    return web.Response(
+        text=json.dumps(payload), status=status,
+        content_type="application/json", headers=_CORS)
+
+
+async def _read_json(request):
+    try:
+        return await request.json()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+async def handle_root(request):
+    return _json_response({
+        "name": "quorum-mcp",
+        "version": __version__,
+        "description": "Attested multi-agent consensus with a shared "
+                       "blackboard",
+        "endpoints": {
+            "mcp": "/mcp",
+            "health": "/health",
+            "oauth_discovery": "/.well-known/oauth-protected-resource",
+        },
+    })
+
+
+async def handle_health(request):
+    return _json_response({"status": "ok"})
+
+
+async def handle_protected_resource_metadata(request):
+    """RFC 9728: this resource server is public -- no auth servers."""
+    base = f"{request.scheme}://{request.host}"
+    return _json_response({
+        "resource": base,
+        "authorization_servers": [],
+    })
+
+
+async def handle_v1_info(request):
+    """Self-describing service info for agents and crawlers -- no auth.
+
+    One GET tells a client what this service is, which tools exist, how
+    auth works, where spans go, and where the docs live. Same shape as
+    the Terradev MCP /v1/info.
+    """
+    return _json_response({
+        "service": {
+            "name": "quorum-mcp",
+            "version": __version__,
+            "description": "Quorum MCP -- attested multi-agent consensus "
+                           "with a shared blackboard. Proposals, votes, "
+                           "and outcomes are Stamp-attested and traced "
+                           "to Telinea.",
+        },
+        "tools": [t["name"] for t in TOOLS],
+        "auth": {
+            "model": "none",
+            "description": "Public endpoint -- no authentication. The "
+                           "proposal id is the capability: only agents "
+                           "given the id can write or vote.",
+        },
+        "spans": {
+            "ingest_url": spans.INGEST_URL,
+            "description": "OTLP endpoint for Telinea span ingestion.",
+        },
+        "docs": "https://terradev.cloud/docs",
+    })
+
+
+async def handle_agent_card(request):
+    """A2A-style agent card discovery -- same shape as Terradev MCP."""
+    base = f"{request.scheme}://{request.host}"
+    return _json_response({
+        "name": "quorum-mcp",
+        "endpoint": base,
+        "skills": [t["name"] for t in TOOLS],
+        "version": __version__,
+        "authentication": None,
+    })
+
+
+async def handle_mcp_options(request):
+    return web.Response(status=204, headers=_CORS)
+
+
+async def handle_mcp_get(request):
+    """SSE channel: clients that expect a streamable endpoint open GET
+    /mcp and hold it. We send a keep-alive comment and hold the socket."""
+    resp = web.StreamResponse(
+        status=200,
+        headers={**_CORS,
+                 "Content-Type": "text/event-stream",
+                 "Cache-Control": "no-cache",
+                 "Connection": "keep-alive"})
+    await resp.prepare(request)
+    try:
+        await resp.write(b": quorum-mcp SSE channel open\n\n")
+        while True:
+            await asyncio.sleep(30)
+            await resp.write(b": keep-alive\n\n")
+    except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
+        pass
+    return resp
+
+
+async def _dispatch_one(m):
+    if not isinstance(m, dict):
+        return error_response(None, -32600, "Invalid Request")
+    return await dispatch(m)
+
+
+async def handle_mcp(request):
+    async with sem:
+        body = await _read_json(request)
+        if body is None:
+            return _json_response(
+                error_response(None, -32700, "Parse error"), status=400)
+
+        if isinstance(body, list):
+            responses = []
+            for m in body:
+                r = await _dispatch_one(m)
+                if r is not None:
+                    responses.append(r)
+            if not responses:
+                return web.Response(status=202, headers=_CORS)
+            return _json_response(responses)
+
+        resp = await _dispatch_one(body)
+        if resp is None:
+            return web.Response(status=202, headers=_CORS)
+        return _json_response(resp)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/v1/info", handle_v1_info)
+    app.router.add_get("/.well-known/agent.json", handle_agent_card)
+    app.router.add_get("/.well-known/agent-card.json", handle_agent_card)
+    app.router.add_get("/.well-known/oauth-protected-resource",
+                       handle_protected_resource_metadata)
+    app.router.add_get("/.well-known/oauth-protected-resource/",
+                       handle_protected_resource_metadata)
+    app.router.add_route("OPTIONS", "/", handle_mcp_options)
+    app.router.add_post("/", handle_mcp)
+    app.router.add_route("OPTIONS", "/mcp", handle_mcp_options)
+    app.router.add_route("OPTIONS", "/mcp/", handle_mcp_options)
+    app.router.add_get("/mcp", handle_mcp_get)
+    app.router.add_post("/mcp", handle_mcp)
+    app.router.add_post("/mcp/", handle_mcp)
+
+    # Persistent loop: emit spans as background tasks, not inline awaits.
+    spans.set_detached(True)
+    port = int(os.environ.get("QUORUM_PORT", "8000"))
+    web.run_app(app, host="127.0.0.1", port=port, print=None)
+
+
+if __name__ == "__main__":
+    main()

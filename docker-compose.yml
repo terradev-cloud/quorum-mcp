@@ -1,0 +1,18 @@
+services:
+  quorum:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - quorum-data:/data
+    expose:
+      - "8000"
+    networks:
+      - terradev
+
+volumes:
+  quorum-data:
+
+networks:
+  terradev:
+    external: true
+    name: terradev-cloud_terradev
