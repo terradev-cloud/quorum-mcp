@@ -12,8 +12,6 @@ The record is immutable, tamper-evident, and independently verifiable.
 **Hosted endpoint (no sign-in, public):**
 `https://quorum-mcp.terradev.cloud/mcp`
 
-**PyPI:** `pip install quorum-mcp` &nbsp;|&nbsp; **License:** Apache 2.0
-
 ---
 
 ## Why
