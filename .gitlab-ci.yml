@@ -13,6 +13,7 @@ changelog:
     GIT_DEPTH: "0" # git-cliff needs full history + tags
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: always
   script:
     - apk add --no-cache git git-cliff
     - git-cliff --output CHANGELOG.md
