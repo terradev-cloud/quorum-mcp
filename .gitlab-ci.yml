@@ -1,8 +1,24 @@
-include:
-  # Shared changelog job — regenerates CHANGELOG.md via git-cliff on every
-  # merge to the default branch. Lives in the sortie repo.
-  - project: 'terradev.cloud/sortie'
-    ref: main
-    file: '/ci/changelog.gitlab-ci.yml'
+# ---------------------------------------------------------------------------
+# changelog — regenerate CHANGELOG.md from conventional commits (git-cliff)
+# on every push to the default branch, committed back with [skip ci].
+# ---------------------------------------------------------------------------
 
-# Changelog comes from the shared include above. Add repo-specific jobs here.
+changelog:
+  stage: .post
+  image: alpine:latest
+  variables:
+    GIT_DEPTH: "0" # git-cliff needs full history + tags
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - apk add --no-cache git git-cliff
+    - git-cliff --output CHANGELOG.md
+    - |
+      if [ -z "$(git status --porcelain CHANGELOG.md)" ]; then
+        echo "CHANGELOG.md unchanged"; exit 0
+      fi
+      git config user.email "theo@terradev.cloud"
+      git config user.name "Theo Wolfenden"
+      git add CHANGELOG.md
+      git commit -m "chore: update CHANGELOG.md [skip ci]"
+      git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_COMMIT_BRANCH}"
