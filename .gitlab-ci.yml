@@ -1,0 +1,8 @@
+include:
+  # Shared changelog job — regenerates CHANGELOG.md via git-cliff on every
+  # merge to the default branch. Lives in the sortie repo.
+  - project: 'terradev.cloud/sortie'
+    ref: main
+    file: '/ci/changelog.gitlab-ci.yml'
+
+# Changelog comes from the shared include above. Add repo-specific jobs here.
