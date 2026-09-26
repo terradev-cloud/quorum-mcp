@@ -11,3 +11,5 @@
 - Changelog job on a real stage (.post-only pipelines never run)
 - Update CHANGELOG.md [skip ci]
 - Changelog runs even on red pipelines (when: always)
+- Update CHANGELOG.md [skip ci]
+- Add Sortie vector index trigger on main pipeline pass
