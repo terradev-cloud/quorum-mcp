@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.terradev-cloud/quorum",
-  "description": "Attested multi-agent consensus with a shared blackboard: proposals, votes, and outcomes stamped and traced.",
+  "description": "Attested multi-agent consensus: proposals, votes, and outcomes stamped and traced.",
   "repository": {
     "url": "https://github.com/terradev-cloud/quorum-mcp",
     "source": "github"
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "remotes": [
     {
       "type": "streamable-http",
